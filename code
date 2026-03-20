@@ -1,0 +1,288 @@
+import tensorflow as tf
+import numpy as np
+from PIL import Image
+import os
+import zipfile
+import h5py
+import json
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, classification_report, confusion_matrix
+import matplotlib
+matplotlib.use('Agg')  # prevents any popup windows from freezing the code
+import matplotlib.pyplot as plt
+
+# ══════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════
+ZIP_PATH     = 'converted_keras.zip'
+DATASET_PATH = 'dataset1'
+IMG_SIZE     = (224, 224)
+EPOCHS       = 30
+BATCH_SIZE   = 32
+
+# ══════════════════════════════════════════════════════
+#  STEP 1 — Extract and patch zip
+# ══════════════════════════════════════════════════════
+print("Extracting model from zip...")
+with zipfile.ZipFile(ZIP_PATH, 'r') as z:
+    z.extractall('./model_files')
+print("Extracted!")
+
+def fix_model(model_path):
+    print("Patching model...")
+    with h5py.File(model_path, 'r+') as f:
+        model_config = f.attrs.get('model_config')
+        if isinstance(model_config, bytes):
+            model_config = model_config.decode('utf-8')
+        model_config = json.loads(model_config)
+        def remove_groups(config):
+            if isinstance(config, dict):
+                config.pop('groups', None)
+                for value in config.values():
+                    remove_groups(value)
+            elif isinstance(config, list):
+                for item in config:
+                    remove_groups(item)
+        remove_groups(model_config)
+        f.attrs['model_config'] = json.dumps(model_config).encode('utf-8')
+    print("Model patched!")
+
+fix_model('./model_files/keras_model.h5')
+
+# ══════════════════════════════════════════════════════
+#  STEP 2 — Load labels
+# ══════════════════════════════════════════════════════
+with open('./model_files/labels.txt', 'r') as f:
+    LABELS = [line.strip().split(' ', 1)[1] for line in f.readlines()]
+print(f"Labels loaded: {LABELS}")
+
+# ══════════════════════════════════════════════════════
+#  STEP 3 — Build optimized model
+# ══════════════════════════════════════════════════════
+print("Building optimized model...")
+
+base_model = tf.keras.applications.MobileNetV2(
+    input_shape=(224, 224, 3),
+    include_top=False,
+    weights='imagenet'
+)
+base_model.trainable = False
+
+model = tf.keras.Sequential([
+    base_model,
+    tf.keras.layers.GlobalAveragePooling2D(),
+    tf.keras.layers.Dense(256, activation='relu'),
+    tf.keras.layers.BatchNormalization(),
+    tf.keras.layers.Dropout(0.4),
+    tf.keras.layers.Dense(128, activation='relu'),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(len(LABELS), activation='softmax')
+])
+
+model.compile(
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+    loss='sparse_categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+model.summary()
+
+# ══════════════════════════════════════════════════════
+#  STEP 4 — Preprocessing
+# ══════════════════════════════════════════════════════
+def preprocess_image(img_path):
+    img = Image.open(img_path).convert('RGB')
+    img = img.resize(IMG_SIZE)
+    img_array = np.array(img, dtype=np.float32)
+    img_array = (img_array / 127.5) - 1.0
+    return img_array
+
+# ══════════════════════════════════════════════════════
+#  STEP 5 — Load Dataset
+# ══════════════════════════════════════════════════════
+def load_dataset(dataset_path):
+    images, labels = [], []
+    for label_idx, letter in enumerate(LABELS):
+        folder = os.path.join(dataset_path, letter)
+        if not os.path.exists(folder):
+            print(f"WARNING: Folder not found → {folder}")
+            continue
+        files = [f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        print(f"  Letter {letter}: {len(files)} images found")
+        for img_file in files:
+            img_path = os.path.join(folder, img_file)
+            try:
+                img_array = preprocess_image(img_path)
+                images.append(img_array)
+                labels.append(label_idx)
+            except Exception as e:
+                print(f"  Skipping {img_file}: {e}")
+    return np.array(images), np.array(labels)
+
+print("\nLoading dataset...")
+images, labels = load_dataset(DATASET_PATH)
+print(f"Total images loaded: {len(images)}")
+
+# ══════════════════════════════════════════════════════
+#  STEP 6 — Train / Validation Split
+# ══════════════════════════════════════════════════════
+X_train, X_val, y_train, y_val = train_test_split(
+    images, labels,
+    test_size=0.2,
+    random_state=42,
+    stratify=labels
+)
+print(f"Training samples:   {len(X_train)}")
+print(f"Validation samples: {len(X_val)}")
+
+# ══════════════════════════════════════════════════════
+#  STEP 7 — Data Augmentation
+# ══════════════════════════════════════════════════════
+data_augmentation = tf.keras.Sequential([
+    tf.keras.layers.RandomFlip('horizontal'),
+    tf.keras.layers.RandomRotation(0.1),
+    tf.keras.layers.RandomZoom(0.1),
+    tf.keras.layers.RandomBrightness(0.2),
+    tf.keras.layers.RandomContrast(0.2),
+])
+
+def augment_dataset(images, labels, augment_times=2):
+    aug_images, aug_labels = list(images), list(labels)
+    for _ in range(augment_times):
+        for img, lbl in zip(images, labels):
+            aug_img = data_augmentation(np.expand_dims(img, 0), training=True)
+            aug_images.append(aug_img[0].numpy())
+            aug_labels.append(lbl)
+    return np.array(aug_images), np.array(aug_labels)
+
+print("\nAugmenting training data...")
+X_train_aug, y_train_aug = augment_dataset(X_train, y_train)
+print(f"Augmented training samples: {len(X_train_aug)}")
+
+# ══════════════════════════════════════════════════════
+#  STEP 8 — Callbacks
+# ══════════════════════════════════════════════════════
+callbacks = [
+    tf.keras.callbacks.EarlyStopping(
+        monitor='val_accuracy',
+        patience=8,
+        restore_best_weights=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        'best_model.keras',
+        monitor='val_accuracy',
+        save_best_only=True,
+        verbose=1
+    ),
+    tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        verbose=1
+    )
+]
+
+# ══════════════════════════════════════════════════════
+#  STEP 9 — Train
+# ══════════════════════════════════════════════════════
+print("\nTraining model...")
+history = model.fit(
+    X_train_aug, y_train_aug,
+    validation_data=(X_val, y_val),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=callbacks
+)
+
+# ══════════════════════════════════════════════════════
+#  STEP 10 — Plot training history (saved to file only)
+# ══════════════════════════════════════════════════════
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+ax1.plot(history.history['accuracy'], label='Train Accuracy')
+ax1.plot(history.history['val_accuracy'], label='Val Accuracy')
+ax1.set_title('Accuracy over Epochs')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Accuracy')
+ax1.legend()
+
+ax2.plot(history.history['loss'], label='Train Loss')
+ax2.plot(history.history['val_loss'], label='Val Loss')
+ax2.set_title('Loss over Epochs')
+ax2.set_xlabel('Epoch')
+ax2.set_ylabel('Loss')
+ax2.legend()
+
+plt.tight_layout()
+plt.savefig('training_history.png')
+plt.close()
+print("Training history saved → training_history.png")
+
+# ══════════════════════════════════════════════════════
+#  STEP 11 — Evaluate on Validation Set
+# ══════════════════════════════════════════════════════
+print("\nEvaluating on validation set...")
+y_pred_probs = model.predict(X_val)
+y_pred       = np.argmax(y_pred_probs, axis=1)
+
+val_accuracy = np.mean(y_pred == y_val)
+val_f1       = f1_score(y_val, y_pred, average='weighted', zero_division=0)
+
+print(f"Validation Accuracy: {val_accuracy:.4f}")
+print(f"Weighted F1 Score:   {val_f1:.4f}")
+print("\nClassification Report:")
+print(classification_report(y_val, y_pred, target_names=LABELS, zero_division=0))
+
+# ══════════════════════════════════════════════════════
+#  STEP 12 — Confusion Matrix (saved to file only)
+# ══════════════════════════════════════════════════════
+cm = confusion_matrix(y_val, y_pred)
+fig, ax = plt.subplots(figsize=(7, 6))
+im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.colorbar(im)
+ax.set(
+    xticks=np.arange(len(LABELS)),
+    yticks=np.arange(len(LABELS)),
+    xticklabels=LABELS,
+    yticklabels=LABELS,
+    xlabel='Predicted Label',
+    ylabel='True Label',
+    title='Confusion Matrix'
+)
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        ax.text(j, i, str(cm[i, j]),
+                ha='center', va='center',
+                color='white' if cm[i, j] > cm.max() / 2 else 'black')
+plt.tight_layout()
+plt.savefig('confusion_matrix.png')
+plt.close()
+print("Confusion matrix saved → confusion_matrix.png")
+
+# ══════════════════════════════════════════════════════
+#  STEP 13 — Save final model
+# ══════════════════════════════════════════════════════
+model.save('asl_final_model.keras')
+print("\n✓ Model saved as asl_final_model.keras — use this on test day!")
+print("✓ Best model also saved as best_model.keras")
+print("\nAll done! Check your project folder for:")
+print("  - asl_final_model.keras")
+print("  - best_model.keras")
+print("  - training_history.png")
+print("  - confusion_matrix.png")
+
+# ══════════════════════════════════════════════════════
+#  STEP 14 — Single Image Inference (for test day)
+# ══════════════════════════════════════════════════════
+def predict_single_image(img_path):
+    img_array = preprocess_image(img_path)
+    img_array = np.expand_dims(img_array, axis=0)
+    prediction = model.predict(img_array)
+    predicted_idx   = np.argmax(prediction)
+    predicted_label = LABELS[predicted_idx]
+    confidence      = prediction[0][predicted_idx] * 100
+    print(f"Prediction: {predicted_label}  (confidence: {confidence:.1f}%)")
+    return predicted_label
+
+# ── Uncomment on test day ──
+# predict_single_image('./test_images/sample.jpg')
